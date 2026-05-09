@@ -165,6 +165,7 @@ import {
 import { resolveSystemPromptOverride } from "../../system-prompt-override.js";
 import { buildSystemPromptParams } from "../../system-prompt-params.js";
 import { buildSystemPromptReport } from "../../system-prompt-report.js";
+import { appendModelIdentitySystemPrompt } from "../../system-prompt.js";
 import { resolveAgentTimeoutMs } from "../../timeout.js";
 import {
   buildEmptyExplicitToolAllowlistError,
@@ -900,6 +901,7 @@ export async function runEmbeddedAttempt(
             modelHasVision: params.model.input?.includes("image") ?? false,
             requireExplicitMessageTarget:
               params.requireExplicitMessageTarget ?? isSubagentSessionKey(params.sessionKey),
+            sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
             disableMessageTool: params.disableMessageTool,
             forceMessageTool: params.forceMessageTool,
             enableHeartbeatTool: params.enableHeartbeatTool,
@@ -1699,6 +1701,7 @@ export async function runEmbeddedAttempt(
           await baseConvertToLlm(normalizeMessagesForLlmBoundary(messages));
       }
       let prePromptMessageCount = activeSession.messages.length;
+      let contextEngineAfterTurnCheckpoint: number | null = null;
       let unwindowedContextEngineMessagesForPrecheck: AgentMessage[] | undefined;
       let contextEnginePromptAuthority: NonNullable<AssembleResult["promptAuthority"]> =
         "assembled";
@@ -1756,6 +1759,9 @@ export async function runEmbeddedAttempt(
           tokenBudget: params.contextTokenBudget,
           modelId: params.modelId,
           getPrePromptMessageCount: () => prePromptMessageCount,
+          onAfterTurnCheckpoint: (messageCount) => {
+            contextEngineAfterTurnCheckpoint = messageCount;
+          },
           getRuntimeContext: ({ messages, prePromptMessageCount: loopPrePromptMessageCount }) =>
             buildAfterTurnRuntimeContext({
               attempt: params,
@@ -1928,6 +1934,7 @@ export async function runEmbeddedAttempt(
         shouldUseWebSocketTransport,
         wsApiKey,
         model: params.model,
+        resolvedApiKey: params.resolvedApiKey,
       });
       activeSession.agent.streamFn = resolveEmbeddedAgentStreamFn({
         currentStreamFn: defaultSessionStreamFn,
@@ -2345,6 +2352,10 @@ export async function runEmbeddedAttempt(
           agent: activeSession?.agent,
           sessionManager,
           clearPendingOnTimeout: true,
+          // PERF: If the run was aborted during the setup,
+          // skip the idle wait and clear pending results synchronously so we can
+          // immediately dispose the session and throw the error without blocking.
+          ...(params.abortSignal?.aborted ? { timeoutMs: 0 } : {}),
         });
         activeSession.dispose();
         throw err;
@@ -2711,6 +2722,14 @@ export async function runEmbeddedAttempt(
               `hooks: applied prependSystemContext/appendSystemContext (${prependSystemLen}+${appendSystemLen} chars)`,
             );
           }
+        }
+        const modelAwareSystemPrompt = appendModelIdentitySystemPrompt({
+          systemPrompt: systemPromptText,
+          model: runtimeInfo.model,
+        });
+        if (modelAwareSystemPrompt !== systemPromptText) {
+          applySystemPromptOverrideToSession(activeSession, modelAwareSystemPrompt);
+          systemPromptText = modelAwareSystemPrompt;
         }
 
         if (cacheObservabilityEnabled) {
@@ -3459,7 +3478,7 @@ export async function runEmbeddedAttempt(
             sessionKey: params.sessionKey,
             sessionFile: params.sessionFile,
             messagesSnapshot,
-            prePromptMessageCount,
+            prePromptMessageCount: contextEngineAfterTurnCheckpoint ?? prePromptMessageCount,
             tokenBudget: params.contextTokenBudget,
             runtimeContext: afterTurnRuntimeContext,
             runMaintenance: async (contextParams) =>
@@ -3845,6 +3864,14 @@ export async function runEmbeddedAttempt(
           bundleMcpRuntime,
           bundleLspRuntime,
           sessionLock,
+          // PERF: If the run was aborted (user stop, timeout, etc.), skip the idle wait
+          // and clear pending results synchronously so we can release the session lock ASAP.
+          aborted:
+            Boolean(params.abortSignal?.aborted) ||
+            aborted ||
+            timedOut ||
+            idleTimedOut ||
+            timedOutDuringCompaction,
         });
       } catch (err) {
         cleanupError = err;

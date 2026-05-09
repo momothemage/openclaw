@@ -325,6 +325,41 @@ async function executeSend(params: {
 }
 
 describe("message tool secret scoping", () => {
+  it("marks message-tool-only source replies in the tool description", () => {
+    const scopedTool = createMessageTool({
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+    const explicitTargetTool = createMessageTool({
+      requireExplicitTarget: true,
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+    const defaultTool = createMessageTool();
+
+    expect(scopedTool.description).toContain(
+      'visible replies to the current source conversation must use action="send"',
+    );
+    expect(scopedTool.description).toContain("target defaults to the current source conversation");
+    expect(scopedTool.description).toContain("Normal final answers are private");
+    expect(explicitTargetTool.description).toContain("Include target when sending");
+    expect(explicitTargetTool.description).not.toContain(
+      "target defaults to the current source conversation",
+    );
+    expect(defaultTool.description).not.toContain(
+      "visible replies to the current source conversation",
+    );
+  });
+
+  it("forwards source reply delivery mode through createOpenClawTools", () => {
+    const tool = createOpenClawTools({
+      config: {} as never,
+      sourceReplyDeliveryMode: "message_tool_only",
+    }).find((candidate) => candidate.name === "message");
+
+    expect(tool?.description).toContain(
+      'visible replies to the current source conversation must use action="send"',
+    );
+  });
+
   it("scopes command-time secret resolution to the selected channel/account", async () => {
     mockSendResult({ channel: "discord", to: "discord:123" });
     mocks.getRuntimeConfig.mockReturnValue({
@@ -689,7 +724,7 @@ describe("message tool schema scoping", () => {
       const properties = getToolProperties(tool);
       const actionEnum = getActionEnum(properties);
 
-      expect(properties.presentation).toBeDefined();
+      expect(properties).toHaveProperty("presentation");
       expect(properties.components).toBeUndefined();
       expect(properties.blocks).toBeUndefined();
       expect(properties.buttons).toBeUndefined();
@@ -697,17 +732,17 @@ describe("message tool schema scoping", () => {
         expect(actionEnum).toContain(action);
       }
       if (expectTelegramPollExtras) {
-        expect(properties.pollDurationSeconds).toBeDefined();
-        expect(properties.pollAnonymous).toBeDefined();
-        expect(properties.pollPublic).toBeDefined();
+        expect(properties).toHaveProperty("pollDurationSeconds");
+        expect(properties).toHaveProperty("pollAnonymous");
+        expect(properties).toHaveProperty("pollPublic");
       } else {
         expect(properties.pollDurationSeconds).toBeUndefined();
         expect(properties.pollAnonymous).toBeUndefined();
         expect(properties.pollPublic).toBeUndefined();
       }
-      expect(properties.pollId).toBeDefined();
-      expect(properties.pollOptionIndex).toBeDefined();
-      expect(properties.pollOptionId).toBeDefined();
+      expect(properties).toHaveProperty("pollId");
+      expect(properties).toHaveProperty("pollOptionIndex");
+      expect(properties).toHaveProperty("pollOptionId");
     },
   );
 
@@ -806,7 +841,7 @@ describe("message tool schema scoping", () => {
       currentChannelProvider: "telegram",
     });
 
-    expect(getToolProperties(scopedTool).presentation).toBeDefined();
+    expect(getToolProperties(scopedTool)).toHaveProperty("presentation");
     expect(getToolProperties(unscopedTool).presentation).toBeUndefined();
   });
 
@@ -1160,8 +1195,8 @@ describe("message tool description", () => {
     const currentChannelProperties = getToolProperties(currentChannelTool);
 
     expect(getActionEnum(currentChannelProperties)).toContain("set-profile");
-    expect(currentChannelProperties.displayName).toBeDefined();
-    expect(currentChannelProperties.avatarUrl).toBeDefined();
+    expect(currentChannelProperties).toHaveProperty("displayName");
+    expect(currentChannelProperties).toHaveProperty("avatarUrl");
   });
 
   it("normalizes channel aliases before building the current channel description", () => {
