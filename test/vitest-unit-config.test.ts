@@ -1,3 +1,4 @@
+// Vitest unit config tests validate unit test project configuration.
 import { afterEach, describe, expect, it } from "vitest";
 import { createPatternFileHelper } from "./helpers/pattern-file.js";
 import { normalizeConfigPath, normalizeConfigPaths } from "./helpers/vitest-config-paths.js";
@@ -5,7 +6,6 @@ import {
   createUnitVitestConfig,
   createUnitVitestConfigWithOptions,
   loadExtraExcludePatternsFromEnv,
-  loadIncludePatternsFromEnv,
   resolveDefaultUnitCoverageIncludePatterns,
 } from "./vitest/vitest.unit.config.ts";
 
@@ -20,27 +20,6 @@ function requireTestConfig<T extends { test?: unknown }>(config: T): NonNullable
 
 afterEach(() => {
   patternFiles.cleanup();
-});
-
-describe("loadIncludePatternsFromEnv", () => {
-  it("returns null when no include file is configured", () => {
-    expect(loadIncludePatternsFromEnv({})).toBeNull();
-  });
-
-  it("loads include patterns from a JSON file", () => {
-    const filePath = patternFiles.writePatternFile("include.json", [
-      "src/infra/update-runner.test.ts",
-      42,
-      "",
-      "ui/src/ui/views/chat.test.ts",
-    ]);
-
-    expect(
-      loadIncludePatternsFromEnv({
-        OPENCLAW_VITEST_INCLUDE_FILE: filePath,
-      }),
-    ).toEqual(["src/infra/update-runner.test.ts", "ui/src/ui/views/chat.test.ts"]);
-  });
 });
 
 describe("loadExtraExcludePatternsFromEnv", () => {
@@ -87,17 +66,30 @@ describe("unit vitest config", () => {
   it("keeps acp and ui tests out of the generic unit lane", () => {
     const unitConfig = createUnitVitestConfig({});
     const testConfig = requireTestConfig(unitConfig);
-    expect(testConfig.exclude).toEqual(expect.arrayContaining(["extensions/**", "test/**"]));
-    expect(testConfig.include).not.toEqual(
-      expect.arrayContaining([
-        "ui/src/ui/app-chat.test.ts",
-        "ui/src/ui/chat/**/*.test.ts",
-        "ui/src/ui/views/chat.test.ts",
-      ]),
-    );
+    expect(testConfig.exclude).toContain("extensions/**");
+    expect(testConfig.exclude).toContain("test/**");
+    for (const pattern of [
+      "ui/src/ui/app-chat.test.ts",
+      "ui/src/ui/chat/**/*.test.ts",
+      "ui/src/ui/views/chat.test.ts",
+    ]) {
+      expect(testConfig.include).not.toContain(pattern);
+    }
   });
 
   it("narrows the active include list to CLI file filters when present", () => {
+    const unitConfig = createUnitVitestConfigWithOptions(
+      {},
+      {
+        argv: ["node", "vitest", "run", "src/commitments/store.test.ts"],
+      },
+    );
+    const testConfig = requireTestConfig(unitConfig);
+    expect(testConfig.include).toEqual(["src/commitments/store.test.ts"]);
+    expect(testConfig.passWithNoTests).toBeUndefined();
+  });
+
+  it("lets root Vitest project runs skip unit files owned by excluded projects", () => {
     const unitConfig = createUnitVitestConfigWithOptions(
       {},
       {
@@ -106,6 +98,18 @@ describe("unit vitest config", () => {
     );
     const testConfig = requireTestConfig(unitConfig);
     expect(testConfig.include).toEqual(["src/config/channel-configured.test.ts"]);
+    expect(testConfig.passWithNoTests).toBe(true);
+  });
+
+  it("lets unrelated root Vitest projects skip when CLI filters match no unit files", () => {
+    const unitConfig = createUnitVitestConfigWithOptions(
+      {},
+      {
+        argv: ["node", "vitest", "run", "extensions/browser/index.test.ts"],
+      },
+    );
+    const testConfig = requireTestConfig(unitConfig);
+    expect(testConfig.include).toEqual([]);
     expect(testConfig.passWithNoTests).toBe(true);
   });
 
@@ -126,35 +130,39 @@ describe("unit vitest config", () => {
       },
     );
     const testConfig = requireTestConfig(unitConfig);
-    expect(testConfig.exclude).toEqual(
-      expect.arrayContaining(["src/commands/**", "src/config/**", "src/security/**"]),
-    );
+    expect(testConfig.exclude).toContain("src/commands/**");
+    expect(testConfig.exclude).toContain("src/config/**");
+    expect(testConfig.exclude).toContain("src/security/**");
+  });
+
+  it("skips default coverage source discovery when coverage is disabled", () => {
+    const unitConfig = createUnitVitestConfig({});
+    const testConfig = requireTestConfig(unitConfig);
+
+    expect(testConfig.coverage?.include).toBeUndefined();
   });
 
   it("scopes default coverage to source files owned by the unit lane", () => {
-    const unitConfig = createUnitVitestConfig({});
+    const unitConfig = createUnitVitestConfigWithOptions(
+      {},
+      {
+        argv: ["node", "vitest", "run", "--coverage"],
+      },
+    );
     const testConfig = requireTestConfig(unitConfig);
     const coverageInclude = testConfig.coverage?.include;
-    expect(coverageInclude).toEqual(
-      expect.arrayContaining([
-        "src/commitments/runtime.ts",
-        "src/media-generation/runtime-shared.ts",
-        "src/web-search/runtime.ts",
-      ]),
-    );
-    expect(coverageInclude).not.toEqual(
-      expect.arrayContaining(["src/markdown/render.ts", "src/security/audit-workspace-skills.ts"]),
-    );
+    expect(coverageInclude).toContain("src/commitments/runtime.ts");
+    expect(coverageInclude).toContain("src/media-generation/runtime-shared.ts");
+    expect(coverageInclude).toContain("src/web-search/runtime.ts");
+    expect(coverageInclude).not.toContain("packages/markdown-core/src/render.ts");
+    expect(coverageInclude).not.toContain("src/security/audit-workspace-skills.ts");
   });
 
   it("derives default coverage includes from non-fast unit tests with sibling source files", () => {
-    expect(resolveDefaultUnitCoverageIncludePatterns()).toEqual(
-      expect.arrayContaining([
-        "packages/memory-host-sdk/src/host/embeddings.ts",
-        "src/commitments/store.ts",
-        "src/tools/planner.ts",
-      ]),
-    );
+    const coverageInclude = resolveDefaultUnitCoverageIncludePatterns();
+    expect(coverageInclude).toContain("packages/memory-host-sdk/src/host/embeddings.ts");
+    expect(coverageInclude).toContain("src/commitments/store.ts");
+    expect(coverageInclude).toContain("src/tools/planner.ts");
   });
 
   it("leaves coverage include filters unset for explicit unit include lists", () => {
@@ -187,15 +195,11 @@ describe("unit vitest config", () => {
       "src/plugin-sdk/facade-runtime.test.ts",
       "src/plugins/loader.test.ts",
     ]);
-    expect(testConfig.exclude).not.toEqual(
-      expect.arrayContaining([
-        "src/infra/**",
-        "src/plugin-sdk/**",
-        "src/plugins/**",
-        "src/infra/matrix-plugin-helper.test.ts",
-        "src/plugin-sdk/facade-runtime.test.ts",
-        "src/plugins/loader.test.ts",
-      ]),
-    );
+    expect(testConfig.exclude).not.toContain("src/infra/**");
+    expect(testConfig.exclude).not.toContain("src/plugin-sdk/**");
+    expect(testConfig.exclude).not.toContain("src/plugins/**");
+    expect(testConfig.exclude).not.toContain("src/infra/matrix-plugin-helper.test.ts");
+    expect(testConfig.exclude).not.toContain("src/plugin-sdk/facade-runtime.test.ts");
+    expect(testConfig.exclude).not.toContain("src/plugins/loader.test.ts");
   });
 });

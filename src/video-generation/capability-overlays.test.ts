@@ -1,3 +1,4 @@
+// Video capability overlay tests cover config-driven capability overrides.
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/types.js";
 import {
@@ -34,11 +35,11 @@ describe("video-generation capability overlays", () => {
       },
     );
 
-    expect(merged.generate).toMatchObject({
+    expect(merged.generate).toEqual({
       supportsAudio: false,
       supportsWatermark: true,
     });
-    expect(merged.imageToVideo).toMatchObject({
+    expect(merged.imageToVideo).toEqual({
       enabled: false,
       maxInputImages: 0,
       supportsAudio: false,
@@ -65,14 +66,44 @@ describe("video-generation capability overlays", () => {
     );
 
     expect(merged.providerOptions).toEqual({ seed: "number", draft: "boolean" });
-    expect(merged.generate).toMatchObject({
+    expect(merged.generate).toEqual({
       supportsAudio: true,
       supportsWatermark: true,
     });
-    expect(merged.imageToVideo).toMatchObject({
+    expect(merged.imageToVideo).toEqual({
       enabled: true,
       maxInputImages: 4,
     });
+  });
+
+  it("lets explicit empty providerOptions overlays clear inherited declarations", () => {
+    const merged = mergeVideoGenerationProviderCapabilities(
+      {
+        providerOptions: { seed: "number" },
+        generate: {
+          providerOptions: { seed: "number" },
+        },
+        imageToVideo: {
+          enabled: true,
+          maxInputImages: 4,
+          providerOptions: { seed: "number" },
+        },
+      },
+      {
+        providerOptions: {},
+        generate: {
+          providerOptions: {},
+        },
+        imageToVideo: {
+          enabled: true,
+          providerOptions: {},
+        },
+      },
+    );
+
+    expect(merged.providerOptions).toEqual({});
+    expect(merged.generate?.providerOptions).toEqual({});
+    expect(merged.imageToVideo?.providerOptions).toEqual({});
   });
 
   it("checks reference inputs against overlaid provider capabilities", async () => {

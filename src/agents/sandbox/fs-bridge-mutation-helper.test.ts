@@ -1,3 +1,5 @@
+// Pinned mutation helper tests cover the Python helper that performs sandbox
+// filesystem mutations through directory file descriptors.
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -57,7 +59,14 @@ function runWritePlan(args: string[], input?: string, env?: NodeJS.ProcessEnv) {
 }
 
 async function expectPathMissing(targetPath: string): Promise<void> {
-  await expect(fs.access(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+  let err: unknown;
+  try {
+    await fs.access(targetPath);
+  } catch (caught) {
+    err = caught;
+  }
+  expect(err).toBeInstanceOf(Error);
+  expect((err as NodeJS.ErrnoException).code).toBe("ENOENT");
 }
 
 const hasAbsolutePythonCandidate = SANDBOX_PINNED_MUTATION_PYTHON_CANDIDATES.some((candidate) =>
@@ -221,6 +230,8 @@ describe("sandbox pinned mutation helper", () => {
   it.runIf(process.platform !== "win32")(
     "rejects symlink-parent writes instead of materializing a temp file outside the mount",
     async () => {
+      // The helper must fail before creating temp files when a parent path is a
+      // symlink to another host directory.
       await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
         const workspace = path.join(root, "workspace");
         const outside = path.join(root, "outside");
@@ -368,6 +379,8 @@ describe("sandbox pinned mutation helper", () => {
   it.runIf(process.platform !== "win32")(
     "keeps source intact and cleans temp directories when directory rename fallback fails",
     async () => {
+      // EXDEV fallback copies first and removes only after validation; failures
+      // must not delete or partially replace the source tree.
       await withTempDir({ prefix: "openclaw-mutation-helper-" }, async (root) => {
         const sourceRoot = path.join(root, "source");
         const destRoot = path.join(root, "dest");

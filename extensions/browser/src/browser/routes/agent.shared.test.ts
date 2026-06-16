@@ -1,5 +1,7 @@
+// Browser tests cover agent.shared plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
+import "../../test-support/browser-security.mock.js";
 import {
   readBody,
   resolveSafeRouteTabUrl,
@@ -163,8 +165,8 @@ describe("browser route shared helpers", () => {
 
       expect(run).not.toHaveBeenCalled();
       expect(response.statusCode).toBe(400);
-      expect(response.body).toMatchObject({ error: expect.any(String) });
       const body = response.body as { error?: unknown };
+      expect(typeof body.error).toBe("string");
       expect(body.error).not.toBe("");
     });
   });

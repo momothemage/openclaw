@@ -1,3 +1,4 @@
+// Plugin npm runtime build tests validate plugin runtime package builds.
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -55,13 +56,18 @@ describe("plugin npm runtime build planning", () => {
       packageDir: path.join(repoRoot, "extensions", "qqbot"),
     });
     const qqbotRuntimePlan = expectPluginNpmRuntimeBuildPlan(qqbotPlan);
-    expect(qqbotRuntimePlan.entry).toEqual(
-      expect.objectContaining({
-        index: path.join(repoRoot, "extensions", "qqbot", "index.ts"),
-        "runtime-api": path.join(repoRoot, "extensions", "qqbot", "runtime-api.ts"),
-        "setup-entry": path.join(repoRoot, "extensions", "qqbot", "setup-entry.ts"),
-      }),
-    );
+    expect(qqbotRuntimePlan.entry).toEqual({
+      api: path.join(repoRoot, "extensions", "qqbot", "api.ts"),
+      "channel-entry-api": path.join(repoRoot, "extensions", "qqbot", "channel-entry-api.ts"),
+      "channel-plugin-api": path.join(repoRoot, "extensions", "qqbot", "channel-plugin-api.ts"),
+      "doctor-contract-api": path.join(repoRoot, "extensions", "qqbot", "doctor-contract-api.ts"),
+      index: path.join(repoRoot, "extensions", "qqbot", "index.ts"),
+      "runtime-api": path.join(repoRoot, "extensions", "qqbot", "runtime-api.ts"),
+      "secret-contract-api": path.join(repoRoot, "extensions", "qqbot", "secret-contract-api.ts"),
+      "setup-entry": path.join(repoRoot, "extensions", "qqbot", "setup-entry.ts"),
+      "setup-plugin-api": path.join(repoRoot, "extensions", "qqbot", "setup-plugin-api.ts"),
+      "tools-api": path.join(repoRoot, "extensions", "qqbot", "tools-api.ts"),
+    });
     expect(qqbotRuntimePlan.runtimeExtensions).toEqual(["./dist/index.js"]);
     expect(qqbotRuntimePlan.runtimeSetupEntry).toBe("./dist/setup-entry.js");
 
@@ -70,18 +76,33 @@ describe("plugin npm runtime build planning", () => {
       packageDir: path.join(repoRoot, "extensions", "diffs"),
     });
     const diffsRuntimePlan = expectPluginNpmRuntimeBuildPlan(diffsPlan);
-    expect(diffsRuntimePlan.entry).toEqual(
-      expect.objectContaining({
-        api: path.join(repoRoot, "extensions", "diffs", "api.ts"),
-        index: path.join(repoRoot, "extensions", "diffs", "index.ts"),
-        "runtime-api": path.join(repoRoot, "extensions", "diffs", "runtime-api.ts"),
-      }),
-    );
+    expect(diffsRuntimePlan.entry).toEqual({
+      api: path.join(repoRoot, "extensions", "diffs", "api.ts"),
+      index: path.join(repoRoot, "extensions", "diffs", "index.ts"),
+      "runtime-api": path.join(repoRoot, "extensions", "diffs", "runtime-api.ts"),
+    });
     expect(diffsRuntimePlan.packageFiles).toEqual([
       "dist/**",
       "openclaw.plugin.json",
+      "npm-shrinkwrap.json",
       "README.md",
       "skills/**",
     ]);
+  });
+
+  it("builds doctor contract surfaces for publishable channel plugins", () => {
+    for (const pluginDir of ["msteams", "nostr"]) {
+      const plan = expectPluginNpmRuntimeBuildPlan(
+        resolvePluginNpmRuntimeBuildPlan({
+          repoRoot,
+          packageDir: path.join(repoRoot, "extensions", pluginDir),
+        }),
+      );
+      expect(plan.entry["doctor-contract-api"]).toBe(
+        path.join(repoRoot, "extensions", pluginDir, "doctor-contract-api.ts"),
+      );
+      expect(plan.runtimeBuildOutputs).toContain("./dist/doctor-contract-api.js");
+      expect(plan.packageFiles).toContain("dist/**");
+    }
   });
 });

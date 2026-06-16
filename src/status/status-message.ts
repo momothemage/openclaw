@@ -1,14 +1,24 @@
+// Status message helpers read and format stored status messages.
 import fs from "node:fs";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import { resolveContextTokensForModel } from "../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
+import { resolveExtraParams } from "../agents/embedded-agent-runner/extra-params.js";
 import { resolveModelAuthMode } from "../agents/model-auth.js";
+import {
+  areRuntimeModelRefsEquivalent,
+  shouldPreferActiveRuntimeAliasAuthLabel,
+} from "../agents/model-runtime-aliases.js";
 import {
   buildModelAliasIndex,
   resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "../agents/model-selection.js";
 import { resolveOpenAITextVerbosity } from "../agents/openai-text-verbosity.js";
-import { resolveExtraParams } from "../agents/pi-embedded-runner/extra-params.js";
 import { resolveSandboxRuntimeStatus } from "../agents/sandbox.js";
 import {
   formatProviderModelRef,
@@ -31,8 +41,9 @@ import {
   type SessionEntry,
   type SessionScope,
 } from "../config/sessions.js";
+import { hasSessionAutoModelFallbackProvenance } from "../config/sessions/model-override-provenance.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { readRecentSessionUsageFromTranscript } from "../gateway/session-utils.fs.js";
+import { readRecentSessionUsageFromTranscript } from "../gateway/session-transcript-readers.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 import { resolveCommitHash } from "../infra/git-commit.js";
 import {
@@ -41,11 +52,6 @@ import {
 } from "../media-understanding/runner.entries.js";
 import type { MediaUnderstandingDecision } from "../media-understanding/types.js";
 import { resolveAgentIdFromSessionKey } from "../routing/session-key.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "../shared/string-coerce.js";
 import { resolveStatusTtsSnapshot } from "../tts/status-config.js";
 import {
   estimateUsageCost,
@@ -78,6 +84,7 @@ export type StatusArgs = {
   config?: OpenClawConfig;
   agent: AgentConfig;
   agentId?: string;
+  configuredDefaultModelLabel?: string;
   runtimeContextTokens?: number;
   explicitConfiguredContextTokens?: number;
   sessionEntry?: SessionEntry;
@@ -101,6 +108,7 @@ export type StatusArgs = {
   mediaDecisions?: ReadonlyArray<MediaUnderstandingDecision>;
   subagentsLine?: string;
   taskLine?: string;
+  pluginHealthLine?: string;
   includeTranscriptUsage?: boolean;
   now?: number;
 };
@@ -141,7 +149,7 @@ function resolveConfiguredTextVerbosity(params: {
 }): "low" | "medium" | "high" | undefined {
   const provider = params.provider?.trim();
   const model = params.model?.trim();
-  if (!provider || !model || (provider !== "openai" && provider !== "openai-codex")) {
+  if (!provider || !model || provider !== "openai") {
     return undefined;
   }
   return resolveOpenAITextVerbosity(
@@ -210,6 +218,36 @@ const formatTokens = (total: number | null | undefined, contextTokens: number | 
   return `${totalLabel}/${ctxLabel}${pct !== null ? ` (${pct}%)` : ""}`;
 };
 
+const formatEstimatedContextBudgetTokens = (
+  status: SessionEntry["contextBudgetStatus"] | undefined,
+  contextTokens: number | null | undefined,
+) => {
+  if (!status || status.source !== "pre-prompt-estimate") {
+    return null;
+  }
+  const estimatedPromptTokens =
+    typeof status.estimatedPromptTokens === "number" &&
+    Number.isFinite(status.estimatedPromptTokens) &&
+    status.estimatedPromptTokens >= 0
+      ? Math.floor(status.estimatedPromptTokens)
+      : undefined;
+  if (estimatedPromptTokens === undefined) {
+    return null;
+  }
+  const ctx =
+    typeof contextTokens === "number" && Number.isFinite(contextTokens) && contextTokens > 0
+      ? contextTokens
+      : typeof status.contextTokenBudget === "number" &&
+          Number.isFinite(status.contextTokenBudget) &&
+          status.contextTokenBudget > 0
+        ? status.contextTokenBudget
+        : undefined;
+  const pct = ctx ? Math.min(999, Math.round((estimatedPromptTokens / ctx) * 100)) : null;
+  const totalLabel = formatTokenCount(estimatedPromptTokens);
+  const ctxLabel = ctx ? formatTokenCount(ctx) : "?";
+  return `~${totalLabel}/${ctxLabel}${pct !== null ? ` (${pct}% est)` : " (est)"}`;
+};
+
 export const formatContextUsageShort = (
   total: number | null | undefined,
   contextTokens: number | null | undefined,
@@ -256,6 +294,7 @@ const readUsageFromSessionLog = (
       cacheWrite: number;
       promptTokens: number;
       total: number;
+      totalTokensFresh: boolean;
       model?: string;
     }
   | undefined => {
@@ -281,10 +320,12 @@ const readUsageFromSessionLog = (
 
   try {
     const snapshot = readRecentSessionUsageFromTranscript(
-      sessionId,
-      storePath,
-      sessionEntry?.sessionFile,
-      agentId ?? (sessionKey ? resolveAgentIdFromSessionKey(sessionKey) : undefined),
+      {
+        agentId: agentId ?? (sessionKey ? resolveAgentIdFromSessionKey(sessionKey) : undefined),
+        sessionFile: sessionEntry?.sessionFile,
+        sessionId,
+        storePath,
+      },
       256 * 1024,
     );
     if (!snapshot) {
@@ -313,6 +354,7 @@ const readUsageFromSessionLog = (
       cacheWrite,
       promptTokens,
       total,
+      totalTokensFresh: snapshot.totalTokensFresh === true,
       model,
     };
   } catch {
@@ -496,6 +538,19 @@ function resolveChannelModelNote(params: {
   return "channel override";
 }
 
+function hasUserPinnedModelSelection(entry: SessionEntry | undefined): boolean {
+  if (!entry?.modelOverride) {
+    return false;
+  }
+  if (entry.modelOverrideSource === "user") {
+    return true;
+  }
+  if (entry.modelOverrideSource === "auto") {
+    return false;
+  }
+  return !hasSessionAutoModelFallbackProvenance(entry);
+}
+
 export function buildStatusMessage(args: StatusArgs): string {
   const now = args.now ?? Date.now();
   const entry = args.sessionEntry;
@@ -536,6 +591,7 @@ export function buildStatusMessage(args: StatusArgs): string {
   const initialFallbackState = resolveActiveFallbackState({
     selectedModelRef: modelRefs.selected.label || "unknown",
     activeModelRef: modelRefs.active.label || "unknown",
+    config: args.config,
     state: entry,
   });
   let activeProvider = modelRefs.active.provider;
@@ -580,15 +636,13 @@ export function buildStatusMessage(args: StatusArgs): string {
   let cacheRead = entry?.cacheRead;
   let cacheWrite = entry?.cacheWrite;
   const freshTotalTokens = resolveFreshSessionTotalTokens(entry);
+  // Undefined freshness is legacy, not stale: keep persisted totals for /status,
+  // but let a fresh transcript prompt snapshot replace them when available.
   const allowTranscriptContextUsage = entry?.totalTokensFresh !== false;
-  let totalTokens =
-    freshTotalTokens ??
-    (entry?.totalTokensFresh === false
-      ? undefined
-      : (entry?.totalTokens ?? (entry?.inputTokens ?? 0) + (entry?.outputTokens ?? 0)));
+  let totalTokens = freshTotalTokens;
 
-  // Prefer prompt-size tokens from the session transcript when it looks larger
-  // (cached prompt tokens are often missing from agent meta/store).
+  // Explicitly stale session/cache usage can still hydrate Tokens/Cache lines
+  // but must not become Context.
   if (args.includeTranscriptUsage) {
     const logUsage = readUsageFromSessionLog(
       entry?.sessionId,
@@ -598,10 +652,17 @@ export function buildStatusMessage(args: StatusArgs): string {
       args.sessionStorePath,
     );
     if (logUsage) {
-      const candidate = logUsage.promptTokens || logUsage.total;
+      const candidate = logUsage.totalTokensFresh
+        ? logUsage.promptTokens || logUsage.total
+        : undefined;
       if (
         allowTranscriptContextUsage &&
-        (!totalTokens || totalTokens === 0 || candidate > totalTokens)
+        candidate !== undefined &&
+        candidate > 0 &&
+        (entry?.totalTokensFresh !== true ||
+          !totalTokens ||
+          totalTokens === 0 ||
+          candidate > totalTokens)
       ) {
         totalTokens = candidate;
       }
@@ -655,13 +716,17 @@ export function buildStatusMessage(args: StatusArgs): string {
     typeof args.runtimeContextTokens === "number" && args.runtimeContextTokens > 0
       ? args.runtimeContextTokens
       : undefined;
+  const resolvedActiveContextTokens = resolveContextTokensForModel({
+    cfg: contextConfig,
+    ...(contextLookupProvider ? { provider: contextLookupProvider } : {}),
+    model: contextLookupModel,
+    allowAsyncLoad: false,
+  });
   const activeContextTokens =
-    resolveContextTokensForModel({
-      cfg: contextConfig,
-      ...(contextLookupProvider ? { provider: contextLookupProvider } : {}),
-      model: contextLookupModel,
-      allowAsyncLoad: false,
-    }) ?? explicitRuntimeContextTokens;
+    typeof explicitRuntimeContextTokens === "number" &&
+    typeof resolvedActiveContextTokens === "number"
+      ? Math.min(explicitRuntimeContextTokens, resolvedActiveContextTokens)
+      : (explicitRuntimeContextTokens ?? resolvedActiveContextTokens);
   const channelModelNote = resolveChannelModelNote({
     config: args.config,
     entry,
@@ -673,6 +738,28 @@ export function buildStatusMessage(args: StatusArgs): string {
     typeof entry?.contextTokens === "number" && entry.contextTokens > 0
       ? entry.contextTokens
       : undefined;
+  const persistedContextMatchesActiveModel = (() => {
+    if (persistedContextTokens === undefined) {
+      return false;
+    }
+    const entryProvider = normalizeLowercaseStringOrEmpty(entry?.modelProvider);
+    const entryModel = normalizeLowercaseStringOrEmpty(entry?.model);
+    const lookupProvider = normalizeLowercaseStringOrEmpty(contextLookupProvider);
+    const lookupModel = normalizeLowercaseStringOrEmpty(contextLookupModel);
+    if (!entryModel || !lookupModel || entryModel !== lookupModel) {
+      return false;
+    }
+    if (entryProvider && lookupProvider && entryProvider !== lookupProvider) {
+      return false;
+    }
+    return !runtimeDiffersFromSelected || initialFallbackState.active;
+  })();
+  const cappedPersistedContextTokens =
+    typeof persistedContextTokens === "number" && typeof activeContextTokens === "number"
+      ? Math.min(persistedContextTokens, activeContextTokens)
+      : persistedContextMatchesActiveModel
+        ? persistedContextTokens
+        : undefined;
   const agentContextTokens =
     typeof args.agent?.contextTokens === "number" && args.agent.contextTokens > 0
       ? args.agent.contextTokens
@@ -712,17 +799,40 @@ export function buildStatusMessage(args: StatusArgs): string {
   const contextTokens = runtimeDiffersFromSelected
     ? (explicitRuntimeContextTokens ??
       (() => {
-        if (persistedContextTokens !== undefined) {
+        const runtimeSnapshotHasFallbackProvenance =
+          initialFallbackState.active ||
+          hasSessionAutoModelFallbackProvenance(entry) ||
+          areRuntimeModelRefsEquivalent(activeModelLabel, modelRefs.selected.label || "unknown");
+        if (!runtimeSnapshotHasFallbackProvenance) {
+          if (typeof selectedContextTokens === "number") {
+            if (explicitConfiguredContextTokens !== undefined) {
+              return Math.min(explicitConfiguredContextTokens, selectedContextTokens);
+            }
+            if (agentContextTokens !== undefined) {
+              return Math.min(agentContextTokens, selectedContextTokens);
+            }
+            return selectedContextTokens;
+          }
+          if (explicitConfiguredContextTokens !== undefined) {
+            return explicitConfiguredContextTokens;
+          }
+          if (agentContextTokens !== undefined) {
+            return agentContextTokens;
+          }
+          return DEFAULT_CONTEXT_TOKENS;
+        }
+        if (cappedPersistedContextTokens !== undefined) {
+          const trustedPersistedContextTokens = cappedPersistedContextTokens;
           const persistedLooksSelectedWindow =
             typeof selectedContextTokens === "number" &&
-            persistedContextTokens === selectedContextTokens;
+            trustedPersistedContextTokens === selectedContextTokens;
           const activeWindowDiffersFromSelected =
             typeof selectedContextTokens === "number" &&
             typeof activeContextTokens === "number" &&
             activeContextTokens !== selectedContextTokens;
           const explicitConfiguredMatchesPersisted =
             typeof explicitConfiguredContextTokens === "number" &&
-            explicitConfiguredContextTokens === persistedContextTokens;
+            explicitConfiguredContextTokens === trustedPersistedContextTokens;
           if (
             persistedLooksSelectedWindow &&
             activeWindowDiffersFromSelected &&
@@ -731,9 +841,9 @@ export function buildStatusMessage(args: StatusArgs): string {
             return activeContextTokens;
           }
           if (typeof activeContextTokens === "number") {
-            return Math.min(persistedContextTokens, activeContextTokens);
+            return Math.min(trustedPersistedContextTokens, activeContextTokens);
           }
-          return persistedContextTokens;
+          return trustedPersistedContextTokens;
         }
         if (cappedConfiguredContextTokens !== undefined) {
           return cappedConfiguredContextTokens;
@@ -749,7 +859,7 @@ export function buildStatusMessage(args: StatusArgs): string {
         model: contextLookupModel,
         contextTokensOverride:
           channelOverrideContextTokens ??
-          persistedContextTokens ??
+          cappedPersistedContextTokens ??
           cappedConfiguredContextTokens ??
           cappedAgentContextTokens ??
           explicitRuntimeContextTokens,
@@ -798,11 +908,16 @@ export function buildStatusMessage(args: StatusArgs): string {
     ? (args.groupActivation ?? entry?.groupActivation ?? "mention")
     : undefined;
 
+  const contextUsageLabel =
+    totalTokens == null || totalTokens === 0
+      ? (formatEstimatedContextBudgetTokens(entry?.contextBudgetStatus, contextTokens) ??
+        formatTokens(totalTokens, contextTokens ?? null))
+      : formatTokens(totalTokens, contextTokens ?? null);
   const contextLine = [
-    `Context: ${formatTokens(totalTokens, contextTokens ?? null)}`,
+    `Context: ${contextUsageLabel}`,
     `🧹 Compactions: ${entry?.compactionCount ?? 0}`,
   ]
-    .filter(Boolean)
+    .filter((line): line is string => Boolean(line))
     .join(" · ");
 
   const queueMode = args.queue?.mode ?? "unknown";
@@ -849,57 +964,92 @@ export function buildStatusMessage(args: StatusArgs): string {
   ];
   const activationLine = activationParts.filter(Boolean).join(" · ");
 
+  const selectedModelLabel = modelRefs.selected.label || "unknown";
+  const runtimeAliasModelEquivalent = areRuntimeModelRefsEquivalent(
+    selectedModelLabel,
+    activeModelLabel,
+    { config: args.config },
+  );
   const selectedAuthMode =
     normalizeAuthMode(args.modelAuth) ?? resolveModelAuthMode(selectedProvider, args.config);
-  const selectedAuthLabelValue =
-    args.modelAuth ??
-    (selectedAuthMode && selectedAuthMode !== "unknown" ? selectedAuthMode : undefined);
+  const rawSelectedAuthLabelValue =
+    selectedAuthMode && selectedAuthMode !== "unknown"
+      ? (args.modelAuth ?? selectedAuthMode)
+      : undefined;
   const activeAuthMode =
     normalizeAuthMode(args.activeModelAuth) ?? resolveModelAuthMode(activeProvider, args.config);
   const activeAuthLabelValue =
-    args.activeModelAuth ??
-    (activeAuthMode && activeAuthMode !== "unknown" ? activeAuthMode : undefined);
-  const selectedModelLabel = modelRefs.selected.label || "unknown";
+    activeAuthMode && activeAuthMode !== "unknown"
+      ? (args.activeModelAuth ?? activeAuthMode)
+      : undefined;
+  const preferActiveAuthLabel = shouldPreferActiveRuntimeAliasAuthLabel({
+    runtimeAliasModelEquivalent,
+    selectedAuthLabel: rawSelectedAuthLabelValue,
+    activeAuthLabel: activeAuthLabelValue,
+  });
+  const selectedAuthLabelValue = preferActiveAuthLabel
+    ? activeAuthLabelValue
+    : (rawSelectedAuthLabelValue ??
+      (runtimeAliasModelEquivalent ? activeAuthLabelValue : undefined));
   const fallbackState = resolveActiveFallbackState({
     selectedModelRef: selectedModelLabel,
     activeModelRef: activeModelLabel,
+    config: args.config,
     state: entry,
   });
-  const effectiveCostAuthMode = fallbackState.active
-    ? activeAuthMode
-    : (selectedAuthMode ?? activeAuthMode);
-  const showCost = effectiveCostAuthMode === "api-key" || effectiveCostAuthMode === "mixed";
-  const hasUsage = typeof inputTokens === "number" || typeof outputTokens === "number";
-  const costConfig =
-    showCost && hasUsage
-      ? resolveModelCostConfig({
-          provider: activeProvider,
-          model: activeModel,
-          config: args.config,
-          allowPluginNormalization: false,
-        })
-      : undefined;
-  const cost =
-    showCost && hasUsage
-      ? estimateUsageCost({
-          usage: {
-            input: inputTokens ?? undefined,
-            output: outputTokens ?? undefined,
-          },
-          cost: costConfig,
-        })
-      : undefined;
-  const costLabel = showCost && hasUsage ? formatUsd(cost) : undefined;
+  const hasUsage =
+    typeof inputTokens === "number" ||
+    typeof outputTokens === "number" ||
+    typeof cacheRead === "number" ||
+    typeof cacheWrite === "number";
+  const costConfig = hasUsage
+    ? resolveModelCostConfig({
+        provider: activeProvider,
+        model: activeModel,
+        config: args.config,
+        allowPluginNormalization: false,
+      })
+    : undefined;
+  const cost = hasUsage
+    ? estimateUsageCost({
+        usage: {
+          input: inputTokens ?? undefined,
+          output: outputTokens ?? undefined,
+          cacheRead: cacheRead ?? undefined,
+          cacheWrite: cacheWrite ?? undefined,
+        },
+        cost: costConfig,
+      })
+    : undefined;
+  const costLabel = hasUsage ? formatUsd(cost) : undefined;
 
   const selectedAuthLabel = selectedAuthLabelValue ? ` · 🔑 ${selectedAuthLabelValue}` : "";
   const modelNote = channelModelNote ? ` · ${channelModelNote}` : "";
-  const modelLine = `🧠 Model: ${selectedModelLabel}${selectedAuthLabel}${modelNote}`;
+  const configuredDefaultModelLabel = normalizeOptionalString(args.configuredDefaultModelLabel);
+  const sessionHasPersistedModelSelection = hasUserPinnedModelSelection(entry);
+  const configDefaultDiffersFromSession =
+    sessionHasPersistedModelSelection &&
+    configuredDefaultModelLabel &&
+    selectedModelLabel !== configuredDefaultModelLabel &&
+    !areRuntimeModelRefsEquivalent(selectedModelLabel, configuredDefaultModelLabel, {
+      config: args.config,
+    });
+  const modelLines = configDefaultDiffersFromSession
+    ? [
+        `🧠 Configured default: ${configuredDefaultModelLabel}`,
+        `📌 Session selected: ${selectedModelLabel}${selectedAuthLabel}${modelNote}`,
+        "⚠️ Reason: session override",
+        `⚠️ This session is pinned to ${selectedModelLabel}; config primary ${configuredDefaultModelLabel} will apply to new/unpinned sessions.`,
+        "↩️ Clear with: /model default",
+        "📖 Docs: https://docs.openclaw.ai/concepts/models#selection-source-and-fallback-behavior",
+      ]
+    : [`🧠 Model: ${selectedModelLabel}${selectedAuthLabel}${modelNote}`];
 
   // Show configured fallback models (from agent model config)
   const configuredFallbacks = (() => {
     const modelConfig = args.agent?.model;
     if (typeof modelConfig === "object" && modelConfig && Array.isArray(modelConfig.fallbacks)) {
-      return modelConfig.fallbacks;
+      return sessionHasPersistedModelSelection ? undefined : modelConfig.fallbacks;
     }
     return undefined;
   })();
@@ -927,7 +1077,7 @@ export function buildStatusMessage(args: StatusArgs): string {
     versionLine,
     args.timeLine,
     args.uptimeLine,
-    modelLine,
+    ...modelLines,
     configuredFallbacksLine,
     fallbackLine,
     usageCostLine,
@@ -939,10 +1089,11 @@ export function buildStatusMessage(args: StatusArgs): string {
     args.subagentsLine,
     args.taskLine,
     `⚙️ ${optionsLine}`,
+    args.pluginHealthLine,
     pluginStatusLine ? `🧩 ${pluginStatusLine}` : null,
     voiceLine,
     activationLine,
   ]
-    .filter(Boolean)
+    .filter((line): line is string => Boolean(line))
     .join("\n");
 }
